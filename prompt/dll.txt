@@ -1,0 +1,477 @@
+# Prompt: Build a Valorant Internal DLL Cheat (UE5, DX11 Overlay, ImGui)
+
+Build a complete internal DLL cheat for Valorant (Unreal Engine 5). This is injected into the game process and hooks DirectX 11 to render an ImGui overlay with ESP, skeleton, aimbot, and a settings menu. The game runs on **UE5 with Large World Coordinates (LWC)** which means all world-space types (FVector, FQuat, FTransform, FMatrix) use **double precision** (not float).
+
+---
+
+## Architecture Overview
+
+The DLL has these source files:
+
+| File | Purpose |
+|------|---------|
+| `dllmain.cpp` | DLL entry point, spawns main thread |
+| `hooks.h` / `hooks.cpp` | DX11 Present/ResizeBuffers hooks via MinHook, ImGui init, game loop |
+| `game.h` | All game memory reading: pointer chains, camera, bones, W2S, aimbot |
+| `offsets.h` | All hardcoded offsets (updated per game patch) |
+| `math.h` | UE5 double-precision math types: FVector, FMatrix, FTransform, FRotator |
+| `menu.h` | ImGui menu UI + ESP drawing (box, skeleton, health, snaplines, hat, head circle) |
+| `spoofcall.h` / `spoofcall.asm` | Return address spoofing for calling game functions |
+
+**Dependencies** (bundled as source):
+- **ImGui** (imgui-master/) — with DX11 + Win32 backends
+- **MinHook** (minhook-master/) — for function hooking
+
+---
+
+## File 1: `math.h` — UE5 Double-Precision Math Types
+
+**CRITICAL**: UE5 uses doubles for world coordinates. All structs must match the engine's memory layout exactly.
+
+```cpp
+struct FVector { double X, Y, Z; };          // 24 bytes
+struct FVector2D { float X, Y; };            // 8 bytes (screen space only)
+struct FRotator { double Pitch, Yaw, Roll; }; // 24 bytes
+struct FMatrix { double M[4][4]; };           // 128 bytes (4x4 doubles)
+```
+
+### FTransform (96 bytes, UE5 layout)
+```
+Offset  Field               Size
+0x00    Rotation[4]         32 bytes (FQuat4d: X,Y,Z,W doubles)
+0x20    TranslationX        8 bytes
+0x28    TranslationY        8 bytes
+0x30    TranslationZ        8 bytes
+0x38    _pad0               8 bytes (alignment)
+0x40    ScaleX              8 bytes
+0x48    ScaleY              8 bytes
+0x50    ScaleZ              8 bytes
+0x58    _pad1               8 bytes (alignment)
+Total:                      96 bytes (0x60)
+```
+
+Include `ToMatrixWithScale()` method that converts quaternion rotation + scale to a 4x4 matrix, and a standalone `MatrixMultiply(a, b)` function.
+
+Also include a standalone `WorldToScreen()` function using camera rotation matrix projection (double-precision math, float output for screen coords).
+
+---
+
+## File 2: `offsets.h` — Game Offsets
+
+All offsets are `constexpr uintptr_t` inside a namespace. These change every game patch.
+
+### Engine Native Functions (code offsets from module base)
+```
+ProcessEvent         = 0x1AF6470
+StaticFindObject     = 0x1B1F7C0
+StaticLoadObject     = 0x1B232F0
+BoneMatrixFunc       = 0x4071D70   // GetBoneMatrix(mesh*, outMatrix*, boneIdx)
+```
+
+### GWorld / Root Pointers (data offsets from module base)
+```
+GWorld               = 0xC0CC120   // DOUBLE DEREFERENCE: *(*(base+GWorld))
+FNamePool            = 0xC25FB80
+FNameState           = 0xC449340   // XOR decryption state array (7 uint64s)
+FNameKey             = FNameState + 0x38
+```
+
+### UWorld Chain
+```
+UWorld → PersistentLevel     = +0x0038
+UWorld → OwningGameInstance  = +0x01D8
+```
+
+### UGameInstance → LocalPlayers
+```
+GameInstance → LocalPlayers  = +0x0040   // TArray<ULocalPlayer*>
+```
+TArray layout: `Data* (+0x00)`, `Count (+0x08 int32)`, `Max (+0x0C int32)`
+
+### ULocalPlayer → PlayerController
+```
+LocalPlayer → PlayerController = +0x0038
+```
+
+### APlayerController
+```
+LocalPlayerPawn      = +0x0460
+AcknowledgedPawn     = +0x0510
+PlayerCameraManager  = +0x0540   // try +0x520 first, fallback +0x540
+MyHUD                = +0x0518
+```
+
+### Camera (APlayerCameraManager)
+UE5 camera uses double-precision. Read from `CameraCachePrivate` → POV:
+```
+CameraCache          = +0x17B0
+ViewInfo             = +0x17C0   // CameraCache + 0x10
+CameraPos            = +0x17C0   // FVector3d (3 doubles = 24 bytes)
+CameraRot            = +0x17D8   // FRotator3d (3 doubles = 24 bytes)  
+CameraFOV            = +0x17F0   // float (NOT double)
+```
+
+### APawn / AActor
+```
+RootComponent        = +0x0288
+RootPosition         = +0x0170   // inside RootComponent (FVector3d)
+PlayerState          = +0x0480
+FNameID              = +0x0018   // actor's FName index (for class name lookup)
+```
+
+### AShooterCharacter (Valorant-specific)
+```
+DamageHandler        = +0x0C68   // must be valid for character filtering
+Health               = +0x0200   // inside DamageHandler
+MeshComponent        = +0x04E8   // USkeletalMeshComponent*
+MeshCosmetic3P       = +0x0EF8
+```
+
+### Team
+```
+TeamComponent        = +0x0690
+TeamID               = +0x00F8   // inside TeamComponent
+```
+
+### PersistentLevel → Actors
+```
+ActorArray           = +0x00A0   // TArray<AActor*>
+ActorCount           = +0x00A8
+```
+
+---
+
+## File 3: `game.h` — Memory Reading & Game Logic
+
+### Safe Memory Read/Write
+Use `__try`/`__except` for ALL memory reads since we're reading game memory that can change:
+```cpp
+template<typename T>
+inline T Read(uintptr_t addr) {
+    if (addr == 0) return T{};
+    __try { return *(T*)addr; }
+    __except(1) { return T{}; }
+}
+```
+
+### Pointer Validation
+Two helpers:
+- `IsValidPtr(ptr)`: between 0x10000 and 0x7FFFFFFFFFFF
+- `IsHeapPtr(ptr)`: above 0x100000000 (4GB), below 0x7FFFFFFFFFFF, and NOT inside game module range
+
+### GWorld Double Dereference
+**CRITICAL**: `Base + Offsets::GWorld` points to a **pointer TO a UWorld pointer**, not the UWorld itself.
+```cpp
+uintptr_t p1 = Read<uintptr_t>(Base + Offsets::GWorld);  // pointer-to-pointer
+uintptr_t world = Read<uintptr_t>(p1);                    // actual UWorld*
+```
+This must be refreshed every frame.
+
+### Pointer Chain (called each frame in UpdatePointers)
+```
+GWorld (double deref) → PersistentLevel (+0x38)
+                      → GameInstance (+0x1D8) → LocalPlayers TArray (+0x40) → [0] = LocalPlayer
+                                                LocalPlayer → PlayerController (+0x38)
+                                                              PlayerController → CameraManager (+0x520 or +0x540)
+                                                                              → AcknowledgedPawn (+0x510)
+```
+
+### UWorld::Levels Auto-Discovery
+Valorant uses streaming sub-levels. PersistentLevel alone won't contain all actors. Auto-discover the `Levels` TArray by scanning UWorld offsets 0x100-0x300:
+- Look for a TArray (Data*, Count, Max) where Count is 1-200
+- Verify that one of the entries matches PersistentLevel
+- Cache the offset once found
+
+### Actor Iteration
+Iterate ALL loaded levels (not just PersistentLevel):
+```cpp
+for each level in UWorld::Levels:
+    read TArray<AActor*> from level + 0xA0
+    for each actor in array:
+        validate pointer (IsHeapPtr, 8-byte aligned)
+```
+
+### Camera Update
+Read from APlayerCameraManager:
+- Location: 3 doubles at CamMgr + 0x17C0
+- Rotation: 3 doubles at CamMgr + 0x17D8 (Pitch, Yaw, Roll in degrees)
+- FOV: float at CamMgr + 0x17F0 (default 103.0 if invalid)
+
+### World-to-Screen Projection
+Manual W2S using camera rotation matrix (no engine call needed):
+1. Convert Pitch/Yaw/Roll from degrees to radians
+2. Build 3 axis vectors from sin/cos of angles:
+   - `ax = { cp*cy, cp*sy, sp }` (forward)
+   - `ay = { sr*sp*cy - cr*sy, sr*sp*sy + cr*cy, -sr*cp }` (right)
+   - `az = { -(cr*sp*cy + sr*sy), cy*sr - cr*sp*sy, cr*cp }` (up)
+3. Project: `delta = world - cameraPos`, dot with each axis
+4. If z (depth) < 1.0: behind camera, return false
+5. Screen coords: `x = screenW/2 + dotRight * (screenW/2) / (z * tan(fovRad))`, similar for Y
+
+### Bone Position (Direct Engine Function Call)
+**Do NOT read bone transforms from memory** — ComponentToWorld is encrypted in Valorant. Instead, call the engine's `GetBoneMatrix` function directly:
+
+```cpp
+using GetBoneMatrix_fn = FMatrix*(__fastcall*)(void* mesh, FMatrix* outResult, int boneIndex);
+auto fn = (GetBoneMatrix_fn)(Base + Offsets::BoneMatrixFunc);  // 0x4071D70
+```
+
+- The function takes the mesh component pointer, an output FMatrix (128 bytes, doubles), and a bone index
+- Returns world-space bone transform matrix
+- Translation (world position) is in row 3: `matrix.M[3][0], M[3][1], M[3][2]`
+- Wrap in `__try/__except` since invalid mesh/bone can crash
+
+### ControlRotation Auto-Discovery (for Aimbot)
+To write aim angles, find `ControlRotation` on PlayerController by scanning offsets 0x200-0x600 for doubles matching current camera Pitch/Yaw (within 0.5° tolerance). Cache the offset once found.
+
+### AimAt Function
+1. Calculate target angles: `targetYaw = atan2(dy, dx) * 180/PI`, `targetPitch = atan2(dz, dist2D) * 180/PI`
+2. Read current rotation from discovered ControlRotation offset
+3. Calculate delta, normalize to ±180°
+4. Apply smoothing: `delta /= smooth`
+5. Write new Pitch and Yaw as doubles directly to PlayerController memory
+
+### FName Decryption
+Valorant encrypts actor class names. The decryption uses:
+- `FNamePool` at base + 0xC25FB80 — contains blocks of FName entries
+- `FNameState` at base + 0xC449340 — array of 7 uint64 XOR keys
+- `FNameKey` at FNameState + 0x38 — the current XOR key
+
+FName entry lookup: `block = fnameId >> 16`, `offset = fnameId & 0xFFFF`
+Entry address: `FNamePool + 0x10 + block*8` → dereference → `+ offset*2`
+Each entry: 2-byte header (length in bits 6+, encrypted flag in bit 0), followed by string data.
+
+The `decrypt_xor_keys` function implements a polynomial hash with 7 cases (mod7 = 0..6), each applying different bit manipulation (subtraction, XOR+bit-interleave, rotation, addition). The exact implementation uses `_rotr64` and specific bitmask constants like `0xAAAAAAAAAAAAAAAA`, `0xCCCCCCCCCCCCCCCC`, `0xF0F0F0F0F0F0F0F0`, `0xFF00FF00FF00FF00`.
+
+---
+
+## File 4: `menu.h` — ImGui Menu & ESP Drawing
+
+### Settings (inline globals)
+```
+ESP: Enabled, Box, BoxCorner, Skeleton, Health, Distance, HeadCircle, Hat, Snapline, Rainbow, Thickness
+Aimbot: Enabled, FOV, Smooth, Bone(head/chest/legs), Key(VK_RBUTTON), DrawFOV
+Misc: (no watermark)
+```
+
+### Bone Skeleton (Multi-Layout)
+Valorant has 3 different skeleton layouts depending on the character's bone count:
+
+| Bone Count | hip | neck | lArm | lHand | lHand1 | rArm | rHand | rHand1 | lThigh | lCalf | lFoot | rThigh | rCalf | rFoot | head |
+|-----------|-----|------|------|-------|--------|------|-------|--------|--------|-------|-------|--------|-------|-------|------|
+| **101** | 3 | 21 | 23 | 24 | 25 | 49 | 50 | 51 | 75 | 76 | 78 | 82 | 83 | 85 | 20 |
+| **103** | 3 | 9 | 33 | 30 | 32 | 58 | 55 | 57 | 63 | 65 | 69 | 77 | 79 | 83 | 8 |
+| **104** | 3 | 21 | 23 | 24 | 25 | 49 | 50 | 51 | 77 | 78 | 80 | 84 | 85 | 87 | 20 |
+
+**Auto-detection**: For each actor, read bone 3 (hip), bone 9 (case-103 neck), bone 21 (case-101/104 neck). Check which "neck" bone is vertically above the hip (Z difference 20-120 units). If bone 9 is valid neck → layout 103. If bone 21 is valid neck → check bone 87 to distinguish 101 vs 104.
+
+13 skeleton connections (same topology for all layouts):
+```
+hip→neck, neck→lArm, lArm→lHand, lHand→lHand1,
+neck→rArm, rArm→rHand, rHand→rHand1,
+hip→lThigh, lThigh→lCalf, lCalf→lFoot,
+hip→rThigh, rThigh→rCalf, rCalf→rFoot
+```
+
+### Menu (ImGui)
+- Toggle with INSERT key
+- Dark purple/blue theme with rounded corners
+- Tabs: Aimbot, Visuals, Misc
+- When menu is open: block game mouse/keyboard input, show ImGui cursor
+
+### ESP Drawing (DrawESP function)
+Called every frame from Present hook. Flow:
+
+1. Skip if nothing enabled, or GWorld/Pawn invalid
+2. Get all actors from all loaded levels
+3. Filter: skip self (AcknowledgedPawn), require valid MeshComponent (+0x4E8) and DamageHandler (+0xC68)
+4. Auto-detect bone layout per actor
+5. Read head + base bone positions using detected layout
+6. Project to screen via W2S
+7. Draw features:
+
+**Box ESP**: Regular rectangle or corner-box style (4 corner L-shapes)
+
+**Head Circle**: Small circle at head screen position, radius = boxHeight * 0.08
+
+**3D Conical Hat**: Wireframe cone above head with:
+- Elliptical brim (16 segments, Y-squashed 0.35x for perspective)
+- Filled triangles from apex to brim with low alpha
+- 4 radial ribs from apex to brim cardinals
+
+**Skeleton**: 13 bone pairs using detected layout, per-bone rainbow hue offset
+
+**Health Bar**: Vertical bar left of the box
+
+**Distance**: Text showing meters (distance / 100)
+
+**Snaplines**: Line from screen bottom-center to actor base
+
+**Rainbow mode**: HSV color cycling, unique hue per entity + per-bone gradient
+
+### Aimbot
+- Activate on key hold (default: right mouse button)  
+- Select closest target to screen center within FOV circle
+- Target bone based on setting (head/chest/pelvis using detected layout)
+- Smooth aim via `Game::AimAt()` with configurable smoothing factor
+- Optional FOV circle drawn on screen
+
+### Watermark
+"NullWare" text at top-left with colored text
+
+---
+
+## File 5: `spoofcall.h` + `spoofcall.asm` — Return Address Spoofing
+
+### Purpose
+When calling game engine functions (like GetBoneMatrix), the return address on the stack points to our DLL. Anti-cheat can scan the call stack. The spoof call system replaces the return address with a gadget found inside the game's own code.
+
+### How It Works
+1. **Gadget scanning** (`initialize_spoofcall`): Scan game module's executable sections for the pattern `FF 15 ?? ?? ?? ?? 48 83 C4 ?? C3` (call [rip+x]; add rsp, N; ret). Group by stack cleanup size.
+2. **Fake callstack**: Build an array of random gadget addresses + random module offsets to create a plausible-looking call stack
+3. **Assembly stub** (`spoofcall_stub`): 
+   - Receives function pointer as last argument (identified by magic value 0x46C4660)
+   - Walks the stack to find the magic sentinel
+   - Pushes fake callstack onto the real stack
+   - Replaces return address with a matching gadget (same stack cleanup size)
+   - Jumps to the target function
+   - On return, the gadget does `add rsp, N; ret` which returns to `cleanup_call`
+
+### Assembly Details
+- Uses MASM syntax (`.asm` file with `spoofcall_stub proc`)
+- Exports: `proxy_call_returns` (QWORD array[32]), `proxy_call_fakestack` (pointer), `proxy_call_fakestack_size` (QWORD)
+- Magic sentinel: `0x46C4660` — checked in registers and on stack to find the function pointer argument
+
+### Template Wrapper
+```cpp
+template<typename Ret, typename... Args>
+Ret SpoofCall(void* func, Args... args) {
+    auto caller = reinterpret_cast<Ret(__fastcall*)(Args..., uintptr_t, void*)>(spoofcall_stub);
+    return caller(args..., 0x46C4660, func);
+}
+```
+
+---
+
+## File 6: `hooks.h` / `hooks.cpp` — DX11 Hook Setup
+
+### DX11 VTable Hooking
+1. Create a dummy D3D11 device + swap chain (hidden window)
+2. Copy the swap chain vtable (first 20 entries)
+3. Hook vtable[8] = Present, vtable[13] = ResizeBuffers
+4. Use MinHook for the actual hooking
+
+### Present Hook (main loop, every frame)
+```
+1. First call: Get ID3D11Device from swap chain, init ImGui (DX11+Win32 backends)
+2. Hook WndProc via SetWindowLongPtrW for input handling
+3. Every frame:
+   a. Get back buffer → create per-frame RenderTargetView (release at end — no caching!)
+   b. ImGui NewFrame
+   c. Game::UpdatePointers() — refresh pointer chain
+   d. Game::UpdateCamera() — read camera pos/rot/fov
+   e. Menu::DrawESP() — overlay drawing
+   f. If menu open: Menu::Draw() — ImGui menu
+   g. ImGui::Render() → OMSetRenderTargets → RenderDrawData
+   h. Release RTV, call original Present
+```
+
+### WndProc Hook
+- INSERT key toggles menu open/closed
+- When menu open: forward all mouse/keyboard events to ImGui, block them from reaching the game
+- When menu closed: pass all input through to game
+
+### ResizeBuffers Hook
+- Update screen dimensions (Game::ScreenW, ScreenH)
+- No RTV cache to invalidate (per-frame creation)
+
+### Shutdown
+Order matters to avoid crashes:
+1. Set `g_Initialized = false`
+2. Sleep 500ms (let in-flight Present finish)
+3. Restore original WndProc FIRST
+4. MH_DisableHook → MH_RemoveHook → MH_Uninitialize
+5. ImGui shutdown (DX11 → Win32 → DestroyContext)
+6. Do NOT release g_Device/g_Context — they belong to the game
+
+---
+
+## File 7: `dllmain.cpp` — Entry Point
+
+```
+DllMain(DLL_PROCESS_ATTACH):
+  1. Save module handle
+  2. DisableThreadLibraryCalls
+  3. CreateThread → MainThread
+
+MainThread:
+  1. AllocConsole + redirect stdout/stderr to CONOUT$
+  2. Wait for "VALORANT-Win64-Shipping.exe" module to load
+  3. Save Game::Base = GetModuleHandleW(...)
+  4. Sleep 3000ms (let game initialize)
+  5. Hooks::Init() (Game::Init + DX11 hooks)
+  6. Beep feedback (800Hz+600Hz = success, 300Hz = fail)
+  7. Wait for END key → Hooks::Shutdown → FreeLibraryAndExitThread
+```
+
+---
+
+## CMake Build Configuration
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(NullWare LANGUAGES C CXX ASM_MASM)
+set(CMAKE_CXX_STANDARD 17)
+
+# ImGui sources (imgui-master/ directory)
+set(IMGUI_SOURCES
+    imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp
+    backends/imgui_impl_dx11.cpp backends/imgui_impl_win32.cpp
+)
+
+# MinHook sources (minhook-master/ directory)
+set(MINHOOK_SOURCES
+    src/buffer.c src/hook.c src/trampoline.c src/hde/hde64.c
+)
+
+add_library(NullWare SHARED
+    src/dllmain.cpp src/hooks.cpp src/spoofcall.asm
+    ${IMGUI_SOURCES} ${MINHOOK_SOURCES}
+)
+
+target_include_directories(NullWare PRIVATE
+    src/ imgui-master/ imgui-master/backends/ minhook-master/include/
+)
+
+target_link_libraries(NullWare PRIVATE d3d11 dxgi dwmapi Psapi)
+target_compile_definitions(NullWare PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+target_compile_options(NullWare PRIVATE /FI"corecrt_math.h")  # MSVC math fix
+```
+
+Output: `NullWare.dll` — inject with any DLL injector.
+
+---
+
+## Critical Implementation Notes
+
+1. **UE5 = doubles everywhere**. FVector is 24 bytes (3 doubles), not 12 bytes (3 floats). FMatrix is 128 bytes. Getting this wrong means every bone position, camera read, and W2S calculation will be garbage.
+
+2. **GWorld is DOUBLE DEREFERENCED**. `Base+GWorld` is a `UWorld**`, not `UWorld*`. You must read twice: `*(*(Base + GWorld))`.
+
+3. **Bone positions via function call, NOT memory read**. Valorant encrypts `ComponentToWorld` transforms. The only reliable way is calling `GetBoneMatrix` at `Base + 0x4071D70` directly. It returns an FMatrix with doubles.
+
+4. **Multi-level actor iteration**. Valorant uses streaming sub-levels. Reading only PersistentLevel misses most actors. You MUST discover the UWorld::Levels TArray and iterate ALL loaded levels.
+
+5. **Pointer tagging**. Valorant tags some pointers with flags in the low 3 bits. Use `ptr & ~0x7ULL` to clear them before dereferencing.
+
+6. **Per-frame RTV creation**. Do NOT cache the D3D11 render target view — it causes reference count leaks. Create and release it every frame.
+
+7. **Camera FOV is a float** at offset 0x17F0, even though Location and Rotation are doubles. Default to 103.0f if invalid.
+
+8. **ControlRotation offset varies per patch**. Auto-discover it by scanning PlayerController memory for doubles matching the camera rotation. Once found, cache it and use it for aimbot writes.
+
+9. **Skeleton layout detection is per-actor**. Different Valorant agents have different bone counts (101, 103, or 104). You MUST detect the layout for each actor individually by checking which neck bone index gives a valid vertical offset from the hip.
+
+10. **Shutdown order is critical**. Restore WndProc BEFORE disabling hooks. Do NOT release the D3D device/context — they belong to the game, releasing them crashes Valorant.
+
+11. **The `spoofcall.asm` must be MASM**. The project uses `ASM_MASM` language in CMake. The magic value 0x46C4660 is hardcoded in both the assembly and the C++ header.

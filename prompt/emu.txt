@@ -1,0 +1,303 @@
+# Prompt: Build a Riot Vanguard VGC Pipe Emulator from Scratch
+
+Build a complete Riot Vanguard Client (vgc) pipe emulator. This consists of **2 executables** + **1 resource file**, built with CMake on Windows (MSVC, C++20). The emulator replaces the real `vgc.exe` service so Valorant launches without Vanguard's kernel anti-cheat active.
+
+---
+
+## Architecture Overview
+
+The system has 3 components:
+
+1. **`vgc.exe`** (fake_vgc.cpp + vgc_version.rc) — A Windows Service that hosts a named pipe. The real VGK kernel driver sends heartbeat packets to this pipe. Our fake service validates incoming packets, builds XOR-scrambled responses with polynomial integrity hashes, and echoes other traffic back. It must behave identically to the real vgc.exe from Vanguard's perspective.
+
+2. **`emu_installer.exe`** (emu_installer.cpp) — An admin-only installer that: sets a registry key, kills Vanguard processes, uninstalls real Vanguard via its own `installer.exe --quiet`, deletes leftover services, copies `vgc.exe` to `%TEMP%`, registers a Windows service named `vgc` with `sc create`, sets an exact SDDL security descriptor, and prompts for restart.
+
+3. **`vgc_version.rc`** — A Win32 version resource that makes `vgc.exe` look like an authentic Riot Games binary in file properties.
+
+---
+
+## File 1: `fake_vgc.cpp` — VGC Pipe Emulator Service
+
+### Constants (EXACT values, do not change)
+```
+Pipe name:          \\.\pipe\933823D3-C77B-4BAE-89D7-A92B567236BC
+Pipe DACL:          D:(A;OICI;GRGW;;;WD)
+Service name:       vgc
+VGC_MAGIC:          0x56474320  (ASCII 'VGC ')
+VGC_RESP_MAGIC:     0x564743C0  (VGC_MAGIC + 0xA0)
+TLS_MAGIC:          0x47534300  (ASCII 'GSC\0')
+Pipe open mode:     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+Pipe mode:          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+Buffer size:        0x1000
+Max instances:      255
+Append interval:    41 (every 41st packet, append VGC_MAGIC)
+Idle timeout:       30000ms
+Max session time:   28 minutes
+Broken pipe retries: 3
+Other error retries: 8
+```
+
+### ValidatePacket Function
+Takes a raw byte buffer (minimum 0x30 bytes). Checks:
+- `dword[0] == VGC_MAGIC` (0x56474320)
+- `dword[1] == 16`
+- Computes a polynomial hash over bytes [8..43] using specific multiplier constants
+
+**Positive multiplier terms** (add to hash):
+```
+2050938145 * buf[2]          (BYTE2 of dword[0])
+994064801  * buf[30]
+326702913  * buf[17]
+1954312449 * buf[35]
+790803233  * buf[18]
+1700710369 * buf[12]
+204809697  * buf[28]
+1359805057 * buf[23]
+1923893921 * buf[22]
+1331628417 * buf[31]
+288867329  * buf[11]
+821255521  * buf[32]
+1043908673 * buf[9]
+942687265  * buf[10]
+89247841   * (33 * buf[7] + buf[8])         // HIBYTE(dword[1]) chain
+67801377   * (buf[34] + 33 * buf[33])
+```
+
+**Nested chain term** (added after scaling by 33):
+```
+33 * (9771233 * buf[3]                       // HIBYTE(dword[0])
+    + buf[42]
+    + 33 * (buf[41]
+        + 33 * (buf[40]
+            + 33 * (buf[39] + 33 * (buf[38] + 33 * buf[37])))))
+```
+
+**Negative multiplier terms** (subtract from hash):
+```
+1407692031 * buf[19]
+2103705759 * buf[16]     (cast as unsigned)
+1831214591 * buf[27]
+869847455  * buf[24]
+936010047  * buf[21]
+1327864255 * buf[25]
+1555599935 * buf[29]
+300539359  * buf[26]
+1718002783 * buf[14]
+702813311  * buf[15]
+331229983  * buf[36]
+823560479  * buf[20]
+859516991  * buf[13]
+1038517951 * buf[1]      (BYTE1 of dword[0])
+```
+
+**Final**: `hash += buf[43]; hash -= 1301956048;`
+**Validate**: `hash == *(int32_t*)(buf + 40)`
+
+### BuildResponse Function
+Creates a 64-byte (0x40) response buffer:
+
+1. **Header**: `dword[0] = 0x564743C0`, `dword[1] = 17`
+2. **Echo**: Copy `dword[2]` and `dword[3]` from request
+3. **Timestamp**: Store `GetTickCount64()` at offset 16 (8 bytes)
+4. **XOR Layer 1** (bytes 24-35 from request):
+```
+resp[24] = pkt[24]            // as-is
+resp[25] = pkt[25] ^ 0x55
+resp[26] = pkt[26] ^ 0xAA
+resp[27] = ~pkt[27]           // bitwise NOT
+resp[28] = pkt[28] ^ 0x54
+resp[29] = pkt[29] ^ 0xA9
+resp[30] = pkt[30] ^ 0xFE
+resp[31] = pkt[31] ^ 0x53
+resp[32] = pkt[32] ^ 0xA8
+resp[33] = pkt[33] ^ 0xFD
+resp[34] = pkt[34] ^ 0x52
+resp[35] = pkt[35] ^ 0xA7
+```
+5. **XOR Layer 2** (bytes 36-39):
+```
+resp[36] = pkt[36] ^ 0xFC
+resp[37] = pkt[37] ^ 0x51
+resp[38] = pkt[38] ^ 0xA6
+resp[39] = pkt[39] ^ 0xFB
+```
+6. **XOR Layer 3** (bytes 40-55, note byte 44 uses pkt[29] not pkt[28]):
+```
+resp[40] = pkt[24] ^ 0x50    resp[41] = pkt[25] ^ 0xA5
+resp[42] = pkt[26] ^ 0xFA    resp[43] = pkt[27] ^ 0x4F
+resp[44] = pkt[29] ^ 0xF9    resp[45] = pkt[30] ^ 0x4E  ← NOTE: pkt[29], skips pkt[28]
+resp[46] = pkt[31] ^ 0xA3    resp[47] = pkt[32] ^ 0xF8
+resp[48] = pkt[33] ^ 0x4D    resp[49] = pkt[34] ^ 0xA2
+resp[50] = pkt[35] ^ 0xF7    resp[51] = pkt[36] ^ 0x4C
+resp[52] = pkt[37] ^ 0xA1    resp[53] = pkt[38] ^ 0xF6
+resp[54] = pkt[39] ^ 0x4B    resp[55] = pkt[28] ^ 0xA4  ← pkt[28] goes last
+```
+
+7. **Response hash** (same polynomial structure as validate, applied to the response buffer — uses the same multiplier constants but referencing different offsets from the response and tick value). Store at `*(int32_t*)(resp + 56)`.
+
+The response hash computation:
+- Extract tick bytes: `tick = GetTickCount64()`, use `(tick >> 8)`, `(tick >> 16)`, `(tick >> 24)`, `(tick >> 32)`, `(tick >> 40)`, `(tick >> 48)`, `(uint8_t)tick`
+- Extract resp[8..12] bytes by masking dwords
+- Apply the SAME positive/negative multiplier arrays to the response bytes at their new positions
+- Include nested 33-chain: `33 * (resp[42] + 33*(resp[41] + 33*(resp[40] + 33*(resp[39] + 33*(resp[38] + 33*resp[37])))))`
+- Additional negative terms for tick high bytes: `1593348959 * (tick>>48)&0xFF`, `1040908095 * (tick>>40)&0xFF`
+- Additional negative terms for resp[12] dword bytes: `1194970687 * BYTE1`, `779327007 * BYTE0`
+- Constant: `rhash += -1074808234 + 1431734823 + 522742816 + 1696545803 - 1651480335`
+- Final: `rhash += resp[43]`
+
+Write response to pipe: `WriteFile(hPipe, resp, 0x40, &written, nullptr)`
+
+### Stealth/Anti-Analysis Features
+
+1. **HeapNoise** — On first connection, create 3 private heaps with `HeapCreate()`. In each, allocate 5 random-sized blocks (4096-0x2000+4096 bytes), fill first 64 bytes with zeros, first block gets 0xCC pattern (32 bytes). This mimics real VGC's heap profile.
+
+2. **AntiTimingDelay** — Before each packet read, burn CPU time for 2-4ms (based on `ThreadId % 3 + 2`) using `QueryPerformanceCounter`. Every 5ms, call `SwitchToThread()`. After the loop, execute `rand() % 1000` iterations of `_mm_pause()`.
+
+3. **CollectSystemInfo** — Every 30 seconds (or every 100 packets), call `GetSystemInfo()`, `GlobalMemoryStatusEx()`, `QueryPerformanceFrequency/Counter()`. Results are discarded — this mimics real VGC's telemetry fingerprinting.
+
+4. **TLS Session Key** — On each connection, `TlsAlloc()` a slot, allocate 0x100 bytes on heap, write `TLS_MAGIC` (0x47534300) at offset 16 (the 5th DWORD). Store via `TlsSetValue()`. Clean up on disconnect.
+
+### Pipe Server Loop (PipeServerThread)
+
+```
+while not stopping:
+  1. Create SECURITY_DESCRIPTOR from DACL "D:(A;OICI;GRGW;;;WD)"
+  2. CreateNamedPipeW(PIPE_NAME, duplex|overlapped, message mode, 255 inst, 0x1000 buf)
+  3. ConnectNamedPipe with overlapped I/O, wait on {pipe_event, stop_event}
+  4. GenerateHeapNoise() on first connection
+  5. Setup: QueryPerformanceFrequency, TLS session, counters
+  
+  inner loop (per connection):
+    a. AntiTimingDelay()
+    b. ReadFile → on fail: increment errors, jitter sleep (tid%25+15 ms), check idle timeout
+    c. On success: reset errors, increment packetCount
+    d. HANDSHAKE: if size>=0x30 && dword[0]==VGC_MAGIC && dword[1]==16:
+         ValidatePacket → BuildResponse → continue
+    e. PID INJECTION: if size>=8 && (dword[0] & 0xF0000000)==0xA0000000:
+         Write GetCurrentProcessId() to dword[1]
+         If size>=0x10: write GetSystemTimeAsFileTime() to offset 8
+    f. PERIODIC APPEND: every 41 packets, append VGC_MAGIC (4 bytes) to buffer
+    g. WriteFile response (echo back, with modifications)
+    h. SESSION LIMIT: break if packetCount > (PID % 0x5DC + 3500)
+    i. TIME LIMIT: break if elapsed > 28 minutes (QPC nanosecond calc)
+    j. Every 100 packets: CollectSystemInfo()
+  
+  cleanup: TlsFree, CloseHandle(pipe), loop back to create new pipe
+```
+
+### Service Framework
+- `ServiceMain`: Register control handler, set SERVICE_RUNNING, spawn `PipeServerThread` via `_beginthreadex`, wait on stop event
+- `ServiceCtrlHandler`: Handle STOP/SHUTDOWN → set `g_bStopping`, signal stop event
+- `wmain`: Try `StartServiceCtrlDispatcherW`. If that fails (not running as service), run `PipeServerThread` directly (debug mode)
+
+---
+
+## File 2: `vgc_version.rc` — Version Resource
+
+A standard Win32 VERSIONINFO resource that makes the binary look like Riot's real vgc.exe:
+```
+FileVersion:     1.90.0.0
+ProductVersion:  1.90.0.0
+CompanyName:     "Riot Games, Inc."
+FileDescription: "Vanguard user-mode service."
+InternalName:    "vgc.exe"
+OriginalFilename:"vgc.exe"
+ProductName:     "Vanguard Client"
+LegalCopyright:  "Copyright (C) 2021"
+Translation:     0x0409 (English), 1200 (Unicode)
+```
+
+---
+
+## File 3: `emu_installer.cpp` — Installer
+
+A console app (run as Administrator) that performs these steps IN ORDER:
+
+### Step 1: Set DevOverrideEnable = 1
+Registry key: `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options`
+Set DWORD value `DevOverrideEnable` = 1
+
+### Step 2: Kill Vanguard Processes
+```
+taskkill /F /IM vgtray.exe >nul 2>&1
+taskkill /F /IM vgc.exe >nul 2>&1
+```
+
+### Step 3: Uninstall Vanguard
+- Find `Riot Vanguard` directory in Program Files (check C: and D:)
+- Run `"<path>\installer.exe" --quiet` with 60s timeout
+- Clean up services: `sc stop vgc/vgk`, `sc delete vgc/vgk`
+
+### Step 4: Re-set DevOverrideEnable = 1
+(In case the uninstaller reset it)
+
+### Step 5: Register Fake VGC Service
+1. Find `vgc.exe` next to the installer executable
+2. Copy it to `%TEMP%\vgc.exe`
+3. Also copy any MSVC runtime DLLs (msvcp140.dll, vcruntime140.dll, etc.)
+4. Run EXACT sc create command:
+```
+sc create vgc binPath= "%TEMP%\vgc.exe" start= demand DisplayName= "vService"
+```
+5. If service already exists, use `sc config` instead
+6. Set EXACT SDDL security descriptor:
+```
+sc sdset vgc D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RPLOCRRC;;;S-1-5-32-545)
+```
+
+### Step 6: Verify
+Query `DevOverrideEnable` from registry and display result. Run `sc qc vgc` to show service config.
+
+### UI
+- Colored console output (green=OK, red=ERROR, yellow=WARN, white=INFO)
+- Banner with version number
+- Post-install instructions (restart PC, how to uninstall)
+- `RunCmd` helper: spawns `cmd.exe /c <command>` via `CreateProcessW` with `CREATE_NO_WINDOW`
+
+---
+
+## CMake Build Configuration
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(VGCEmulator LANGUAGES CXX RC)
+set(CMAKE_CXX_STANDARD 20)
+
+# VGC service
+add_executable(vgc tools/fake_vgc.cpp tools/vgc_version.rc)
+target_link_libraries(vgc PRIVATE advapi32)
+set_target_properties(vgc PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/emu"
+    OUTPUT_NAME "vgc"
+)
+
+# Installer
+add_executable(emu_installer tools/emu_installer.cpp)
+target_link_libraries(emu_installer PRIVATE advapi32 shell32)
+set_target_properties(emu_installer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/emu"
+    OUTPUT_NAME "emu_installer"
+)
+
+# Release: /O2 /MT (static CRT)
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_options(vgc PRIVATE /O2 /MT)
+    target_compile_options(emu_installer PRIVATE /O2 /MT)
+endif()
+```
+
+Build: `cmake -B build && cmake --build build --config Release`
+Output: `build/emu/vgc.exe` and `build/emu/emu_installer.exe`
+
+---
+
+## Critical Implementation Notes
+
+1. **The polynomial hash constants are EXACT.** Every single multiplier value must match precisely or the kernel driver will reject packets and Valorant won't launch.
+2. **The XOR pattern in BuildResponse has an intentional skip**: byte 44 uses `pkt[29]` not `pkt[28]`, and byte 55 uses `pkt[28]`. This is NOT a bug—it matches the decompiled binary exactly.
+3. **The response hash has duplicate subtraction**: `resp[36]` appears in BOTH a negative term (`936010047`) AND another negative term (`823560479`). This is correct per the decompilation.
+4. **Session limit uses PID**: `GetCurrentProcessId() % 0x5DC + 3500` packets before reconnecting. This creates natural variation between runs.
+5. **The nested 33-chain appears in BOTH ValidatePacket and the response hash computation** — same polynomial structure, different byte sources.
+6. **Pipe is MESSAGE mode, not BYTE mode.** This is critical for packet framing.
+7. **`wmain` not `main`** — both executables use Unicode entry points.
+8. **Static CRT (/MT)** — no external DLL dependencies in Release builds.
